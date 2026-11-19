@@ -75,6 +75,20 @@ class CoinbaseClient:
                 "order_configuration": {"market_market_ioc": {size_field: str(size)}}}
         return self._request("POST", "/api/v3/brokerage/orders", body=body)
 
+    def best_bid_ask(self, product_id):
+        r = self._request("GET", "/api/v3/brokerage/best_bid_ask", params={"product_ids": product_id})
+        book = r["pricebooks"][0]
+        return float(book["bids"][0]["price"]), float(book["asks"][0]["price"])
+
+    def limit_order_post_only(self, client_order_id, product_id, side, base_size, limit_price):
+        body = {"client_order_id": client_order_id, "product_id": product_id, "side": side,
+                "order_configuration": {"limit_limit_gtc": {
+                    "base_size": str(base_size), "limit_price": str(limit_price), "post_only": True}}}
+        return self._request("POST", "/api/v3/brokerage/orders", body=body)
+
+    def cancel_orders(self, order_ids):
+        return self._request("POST", "/api/v3/brokerage/orders/batch_cancel", body={"order_ids": order_ids})
+
     def market_order_buy(self, client_order_id, product_id, quote_size):
         return self._market(client_order_id, product_id, "BUY", "quote_size", quote_size)
 
