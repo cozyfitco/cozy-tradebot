@@ -58,6 +58,8 @@ class Config:
     TRAILING_STOP_PCT = float(env("TRAILING_STOP_PCT", 1.0))
     FEE_RATE_PCT = float(env("FEE_RATE_PCT", 0.6))          # Coinbase taker fee at your tier
     COOLDOWN_MIN = int(env("COOLDOWN_MIN", 30))             # wait after a stop-loss
+    USE_LIMIT_ORDERS = env_bool("USE_LIMIT_ORDERS", True)   # post-only limits = lower maker fees
+    LIMIT_WAIT_SEC = int(env("LIMIT_WAIT_SEC", 90))         # how long a limit order waits to fill
 
     CHECK_INTERVAL_MIN = int(env("CHECK_INTERVAL_MIN", 10))
     GRANULARITY = env("CANDLE_GRANULARITY", "FIVE_MINUTE")
@@ -213,6 +215,48 @@ class Bot:
             time.sleep(1)
         raise RuntimeError(f"order {order_id} not filled in {timeout}s")
 
+    def _info(self, product_id):
+        if product_id not in self.product_info:
+            self.product_info[product_id] = as_dict(self.client.get_public_product(product_id=product_id))
+        return self.product_info[product_id]
+
+    def _poll(self, order_id, timeout):
+        """Wait until order is done or timeout. Returns latest order dict."""
+        deadline = time.time() + timeout
+        o = {}
+        while True:
+            o = as_dict(self.client.get_order(order_id=order_id)).get("order", {})
+            if o.get("status") in ("FILLED", "CANCELLED", "EXPIRED", "FAILED"):
+                return o
+            if time.time() >= deadline:
+                return o
+            time.sleep(2)
+
+    def _limit(self, product_id, side, size, price):
+        """Post-only limit order. Waits LIMIT_WAIT_SEC, cancels leftover. Returns final order or None."""
+        resp = as_dict(self.client.limit_order_post_only(
+            client_order_id=str(uuid.uuid4()), product_id=product_id, side=side,
+            base_size=size, limit_price=price))
+        if not resp.get("success"):
+            log.info("%s limit %s not placed: %s", side, product_id, resp.get("error_response"))
+            return None
+        oid = resp["success_response"]["order_id"]
+        o = self._poll(oid, self.cfg.LIMIT_WAIT_SEC)
+        if o.get("status") != "FILLED":
+            try:
+                self.client.cancel_orders(order_ids=[oid])
+            except Exception as e:
+                log.warning("cancel %s failed: %s", oid, e)
+            o = self._poll(oid, 20)
+        return o
+
+    @staticmethod
+    def _filled(o):
+        size = float(o.get("filled_size") or 0)
+        avg = float(o.get("average_filled_price") or 0)
+        fees = float(o.get("total_fees") or 0)
+        return size, avg, fees
+
     def buy(self, product_id, px):
         usd = self.cfg.TRADE_SIZE_USD
         fee_rate = self.cfg.FEE_RATE_PCT / 100
@@ -225,18 +269,39 @@ class Bot:
             self.state["paper_usd"] -= usd
             return {"size": size, "entry_price": px, "cost": usd}
 
+        if self.cfg.USE_LIMIT_ORDERS:
+            info = self._info(product_id)
+            bid, _ = self.client.best_bid_ask(product_id)
+            price = round_down(bid, info.get("quote_increment", "0.0001"))
+            size = round_down(usd / float(price) / (1 + fee_rate), info.get("base_increment", "0.00000001"))
+            o = self._limit(product_id, "BUY", size, price)
+            if not o:
+                return None
+            filled, avg, fees = self._filled(o)
+            if filled <= 0:
+                log.info("BUY limit %s didn't fill, skipped", product_id)
+                return None
+            return {"size": filled, "entry_price": avg, "cost": filled * avg + fees}
+
         resp = as_dict(self.client.market_order_buy(
             client_order_id=str(uuid.uuid4()), product_id=product_id, quote_size=f"{usd:.2f}"))
         if not resp.get("success"):
             log.error("BUY rejected %s: %s", product_id, resp.get("error_response"))
             return None
         o = self._wait_fill(resp["success_response"]["order_id"])
-        size = float(o["filled_size"])
-        avg = float(o["average_filled_price"])
-        cost = float(o.get("total_value_after_fees") or (size * avg + float(o.get("total_fees", 0))))
+        size, avg, fees = self._filled(o)
+        cost = float(o.get("total_value_after_fees") or (size * avg + fees))
         return {"size": size, "entry_price": avg, "cost": cost}
 
-    def sell(self, product_id, pos, px):
+    def _market_sell(self, product_id, size):
+        resp = as_dict(self.client.market_order_sell(
+            client_order_id=str(uuid.uuid4()), product_id=product_id, base_size=size))
+        if not resp.get("success"):
+            log.error("SELL rejected %s: %s", product_id, resp.get("error_response"))
+            return None
+        return self._wait_fill(resp["success_response"]["order_id"])
+
+    def sell(self, product_id, pos, px, reason="exit"):
         fee_rate = self.cfg.FEE_RATE_PCT / 100
         if self.cfg.PAPER_TRADING:
             gross = pos["size"] * px
@@ -244,18 +309,30 @@ class Bot:
             self.state["paper_usd"] += proceeds
             return {"exit_price": px, "proceeds": proceeds}
 
-        inc = self.product_info.get(product_id, {}).get("base_increment", "0.00000001")
-        size = round_down(pos["size"], inc)
-        resp = as_dict(self.client.market_order_sell(
-            client_order_id=str(uuid.uuid4()), product_id=product_id, base_size=size))
-        if not resp.get("success"):
-            log.error("SELL rejected %s: %s", product_id, resp.get("error_response"))
+        info = self._info(product_id)
+        inc = info.get("base_increment", "0.00000001")
+        remaining = float(round_down(pos["size"], inc))
+        sold, value, fees = 0.0, 0.0, 0.0
+
+        # stop-loss always sells at market so it exits immediately
+        if self.cfg.USE_LIMIT_ORDERS and reason != "stop_loss":
+            _, ask = self.client.best_bid_ask(product_id)
+            price = round_down(ask, info.get("quote_increment", "0.0001"))
+            o = self._limit(product_id, "SELL", round_down(remaining, inc), price)
+            if o:
+                f, avg, fe = self._filled(o)
+                sold += f; value += f * avg; fees += fe
+                remaining = float(round_down(remaining - f, inc))
+
+        min_size = float(info.get("base_min_size") or 0)
+        if remaining > 0 and remaining >= min_size:
+            o = self._market_sell(product_id, round_down(remaining, inc))
+            if o:
+                f, avg, fe = self._filled(o)
+                sold += f; value += f * avg; fees += fe
+        if sold <= 0:
             return None
-        o = self._wait_fill(resp["success_response"]["order_id"])
-        avg = float(o["average_filled_price"])
-        filled = float(o["filled_size"])
-        proceeds = float(o.get("total_value_after_fees") or (filled * avg - float(o.get("total_fees", 0))))
-        return {"exit_price": avg, "proceeds": proceeds}
+        return {"exit_price": value / sold, "proceeds": value - fees}
 
     # ---------- logging trades ----------
     def _record(self, product_id, pos, result, reason, now):
@@ -294,7 +371,7 @@ class Bot:
             elif pos.get("exit_signal"):
                 reason = "trend_reversal"
             if reason:
-                result = self.sell(pid, pos, px)
+                result = self.sell(pid, pos, px, reason)
                 if result:
                     self._record(pid, pos, result, reason, now)
                     del self.state["positions"][pid]
