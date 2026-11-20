@@ -202,15 +202,25 @@ class Bot:
         n = min(300, self.cfg.TREND_EMA + 60)
         end = int(now)
         start = end - gran * n
-        resp = as_dict(self.client.get_public_candles(
+        fetch = self.client.get_public_candles if self.cfg.PAPER_TRADING else self.client.get_candles
+        resp = as_dict(fetch(
             product_id=product_id, start=str(start), end=str(end), granularity=self.cfg.GRANULARITY))
         candles = sorted(resp.get("candles", []), key=lambda c: int(c["start"]))
         # drop the candle that's still forming
         candles = [c for c in candles if int(c["start"]) + gran <= end]
+        # refuse stale data: newest closed candle must have ended within the last 2 candles
+        if not candles or int(candles[-1]["start"]) + gran < end - 2 * gran:
+            age = (end - int(candles[-1]["start"]) - gran) / 60 if candles else -1
+            raise RuntimeError(f"stale candle data for {product_id} ({age:.0f} min old)")
         return [float(c["close"]) for c in candles]
 
+    def _product(self, product_id):
+        if self.cfg.PAPER_TRADING:
+            return as_dict(self.client.get_public_product(product_id=product_id))
+        return as_dict(self.client.get_product(product_id=product_id))
+
     def price(self, product_id):
-        info = as_dict(self.client.get_public_product(product_id=product_id))
+        info = self._product(product_id)
         self.product_info[product_id] = info
         return float(info["price"])
 
@@ -228,7 +238,7 @@ class Bot:
 
     def _info(self, product_id):
         if product_id not in self.product_info:
-            self.product_info[product_id] = as_dict(self.client.get_public_product(product_id=product_id))
+            self.product_info[product_id] = self._product(product_id)
         return self.product_info[product_id]
 
     def _poll(self, order_id, timeout):
@@ -287,7 +297,7 @@ class Bot:
         if self.cfg.USE_USDC and bal["USDC"] >= need and product_id.endswith("-USD"):
             alt = product_id[:-4] + "-USDC"
             try:
-                info = as_dict(self.client.get_public_product(product_id=alt))
+                info = self._product(alt)
                 if info.get("trading_disabled") or info.get("is_disabled"):
                     return None
                 self.product_info[alt] = info

@@ -63,6 +63,14 @@ class CoinbaseClient:
     def get_public_product(self, product_id):
         return self._request("GET", f"/api/v3/brokerage/market/products/{product_id}", auth=False)
 
+    # ---------- private market data (not CDN-cached; use in live mode) ----------
+    def get_candles(self, product_id, start, end, granularity):
+        return self._request("GET", f"/api/v3/brokerage/products/{product_id}/candles",
+                             params={"start": start, "end": end, "granularity": granularity})
+
+    def get_product(self, product_id):
+        return self._request("GET", f"/api/v3/brokerage/products/{product_id}")
+
     # ---------- private ----------
     def get_accounts(self):
         return self._request("GET", "/api/v3/brokerage/accounts")
