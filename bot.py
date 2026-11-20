@@ -69,6 +69,7 @@ class Config:
     MARKET_FILTER = env("MARKET_FILTER", "BTC-USD")         # only buy when this is above its trend EMA
     MAX_SPREAD_PCT = float(env("MAX_SPREAD_PCT", 0.3))      # skip coins with a wide bid/ask gap
     USE_USDC = env_bool("USE_USDC", True)                   # spend USDC when USD runs low
+    ADOPT_HOLDINGS = env("ADOPT_HOLDINGS", "")              # e.g. "VVV-USDC:22.013,ETH-USD:0"
     USE_LIMIT_ORDERS = env_bool("USE_LIMIT_ORDERS", True)   # post-only limits = lower maker fees
     LIMIT_WAIT_SEC = int(env("LIMIT_WAIT_SEC", 90))         # how long a limit order waits to fill
 
@@ -417,6 +418,54 @@ class Bot:
                  product_id, reason, pnl, self.state["daily"]["pnl"], self.state["total_pnl"],
                  self.state["wins"], self.state["losses"])
 
+    # ---------- take over coins already in the account ----------
+    def adopt_holdings(self, now):
+        """ADOPT_HOLDINGS="VVV-USDC:22.013,ETH-USD:0" -> manage those coins with the same exit rules.
+        Price 0 = use the current price as the buy price. Each coin is adopted once (survives restarts).
+        Adopted coins don't count toward MAX_OPEN_POSITIONS."""
+        spec = self.cfg.ADOPT_HOLDINGS
+        if not spec or self.cfg.PAPER_TRADING:
+            return
+        done = self.state.setdefault("adopted", [])
+        try:
+            accts = as_dict(self.client.get_accounts()).get("accounts", [])
+        except Exception as e:
+            log.warning("adopt: balance check failed: %s", e)
+            return
+        bal = {}
+        for a in accts:
+            cur = a.get("currency")
+            bal[cur] = bal.get(cur, 0.0) + float(a.get("available_balance", {}).get("value", 0) or 0)
+        for item in spec.split(","):
+            if ":" not in item:
+                continue
+            pid, entry = item.split(":", 1)
+            pid, entry = pid.strip().upper(), float(entry or 0)
+            if pid in done or pid in self.state["positions"]:
+                continue
+            base = pid.split("-")[0]
+            size = bal.get(base, 0.0)
+            try:
+                px = self.price(pid)
+            except Exception as e:
+                log.warning("adopt %s: price failed: %s", pid, e)
+                continue
+            if size * px < 1:
+                log.info("adopt %s: balance too small ($%.2f), skipped", pid, size * px)
+                done.append(pid)
+                continue
+            entry = entry or px
+            self.state["positions"][pid] = {"size": size, "entry_price": entry, "cost": size * entry,
+                                            "peak": max(entry, px), "opened_at": now,
+                                            "trade_pid": pid, "adopted": True}
+            done.append(pid)
+            log.info("ADOPTED %s size=%s entry=%.6f now=%.6f (%.1f%%)", pid, size, entry, px,
+                     (px / entry - 1) * 100)
+        self._save_state()
+
+    def bot_positions(self):
+        return sum(1 for p in self.state["positions"].values() if not p.get("adopted"))
+
     # ---------- core loop pieces ----------
     def check_exits(self, now):
         for pid, pos in list(self.state["positions"].items()):
@@ -502,7 +551,7 @@ class Bot:
                 log.warning("Daily loss limit hit ($%.2f). No new trades until tomorrow.",
                             self.state["daily"]["pnl"])
                 return
-            if len(self.state["positions"]) >= self.cfg.MAX_OPEN_POSITIONS:
+            if self.bot_positions() >= self.cfg.MAX_OPEN_POSITIONS:
                 continue
             if self.state["cooldown"].get(pid, 0) > now:
                 continue
@@ -567,6 +616,10 @@ def main():
              Config.STOP_LOSS_PCT, Config.TRAILING_STOP_PCT, Config.TRAIL_ACTIVATE_PCT,
              Config.STALE_HOURS, Config.MAX_DAILY_LOSS_USD)
     bot = Bot(make_client())
+    try:
+        bot.adopt_holdings(time.time())
+    except Exception as e:
+        log.exception("adopt failed: %s", e)
     while True:
         try:
             bot.tick()
