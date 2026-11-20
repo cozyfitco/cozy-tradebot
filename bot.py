@@ -68,6 +68,7 @@ class Config:
     # Entry filters
     MARKET_FILTER = env("MARKET_FILTER", "BTC-USD")         # only buy when this is above its trend EMA
     MAX_SPREAD_PCT = float(env("MAX_SPREAD_PCT", 0.3))      # skip coins with a wide bid/ask gap
+    USE_USDC = env_bool("USE_USDC", True)                   # spend USDC when USD runs low
     USE_LIMIT_ORDERS = env_bool("USE_LIMIT_ORDERS", True)   # post-only limits = lower maker fees
     LIMIT_WAIT_SEC = int(env("LIMIT_WAIT_SEC", 90))         # how long a limit order waits to fill
 
@@ -267,9 +268,49 @@ class Bot:
         fees = float(o.get("total_fees") or 0)
         return size, avg, fees
 
+    def funding_pair(self, product_id):
+        """Pick which cash to spend: USD first, then USDC (same coin, -USDC pair).
+        Returns the product to trade, or None if neither balance covers a trade."""
+        need = self.cfg.TRADE_SIZE_USD
+        try:
+            accts = as_dict(self.client.get_accounts()).get("accounts", [])
+        except Exception as e:
+            log.warning("balance check failed: %s", e)
+            return None
+        bal = {"USD": 0.0, "USDC": 0.0}
+        for a in accts:
+            cur = a.get("currency")
+            if cur in bal:
+                bal[cur] += float(a.get("available_balance", {}).get("value", 0) or 0)
+        if bal["USD"] >= need:
+            return product_id
+        if self.cfg.USE_USDC and bal["USDC"] >= need and product_id.endswith("-USD"):
+            alt = product_id[:-4] + "-USDC"
+            try:
+                info = as_dict(self.client.get_public_product(product_id=alt))
+                if info.get("trading_disabled") or info.get("is_disabled"):
+                    return None
+                self.product_info[alt] = info
+            except Exception:
+                log.info("%s not available, skipped", alt)
+                return None
+            log.info("USD $%.2f low, using USDC ($%.2f) via %s", bal["USD"], bal["USDC"], alt)
+            return alt
+        log.info("Not enough USD ($%.2f) or USDC ($%.2f) for a $%.0f trade",
+                 bal["USD"], bal["USDC"], need)
+        return None
+
     def buy(self, product_id, px):
         usd = self.cfg.TRADE_SIZE_USD
         fee_rate = self.cfg.FEE_RATE_PCT / 100
+        if not self.cfg.PAPER_TRADING:
+            trade_pid = self.funding_pair(product_id)
+            if not trade_pid:
+                return None
+            fill = self._buy_live(trade_pid, usd, fee_rate)
+            if fill:
+                fill["trade_pid"] = trade_pid
+            return fill
         if self.cfg.PAPER_TRADING:
             if self.state["paper_usd"] < usd:
                 log.warning("Paper balance too low for %s", product_id)
@@ -279,6 +320,7 @@ class Bot:
             self.state["paper_usd"] -= usd
             return {"size": size, "entry_price": px, "cost": usd}
 
+    def _buy_live(self, product_id, usd, fee_rate):
         if self.cfg.USE_LIMIT_ORDERS:
             info = self._info(product_id)
             bid, _ = self.client.best_bid_ask(product_id)
@@ -312,6 +354,7 @@ class Bot:
         return self._wait_fill(resp["success_response"]["order_id"])
 
     def sell(self, product_id, pos, px, reason="exit"):
+        product_id = pos.get("trade_pid", product_id)  # sell back to the cash it was bought with
         fee_rate = self.cfg.FEE_RATE_PCT / 100
         if self.cfg.PAPER_TRADING:
             gross = pos["size"] * px
