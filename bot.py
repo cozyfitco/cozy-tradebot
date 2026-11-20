@@ -47,17 +47,27 @@ class Config:
     API_KEY = os.getenv("COINBASE_API_KEY", "")
     API_SECRET = os.getenv("COINBASE_API_SECRET", "").replace("\\n", "\n")
 
-    PRODUCTS = [p.strip().upper() for p in env("PRODUCTS", "BTC-USD,ETH-USD").split(",") if p.strip()]
+    PRODUCTS = [p.strip().upper() for p in env(
+        "PRODUCTS", "BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,LTC-USD,DOGE-USD,ADA-USD,DOT-USD"
+    ).split(",") if p.strip()]
     TRADE_SIZE_USD = float(env("TRADE_SIZE_USD", 25))
-    MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS", 2))
+    MAX_OPEN_POSITIONS = int(env("MAX_OPEN_POSITIONS", 4))
     MAX_DAILY_LOSS_USD = float(env("MAX_DAILY_LOSS_USD", 5))
 
-    STOP_LOSS_PCT = float(env("STOP_LOSS_PCT", 2.0))
-    TAKE_PROFIT_PCT = float(env("TAKE_PROFIT_PCT", 3.5))
-    TRAIL_ACTIVATE_PCT = float(env("TRAIL_ACTIVATE_PCT", 2.0))
+    # Exits: hold through normal dips, sell on a big drop; ride winners with a trailing stop
+    STOP_LOSS_PCT = float(env("STOP_LOSS_PCT", 15.0))       # safety net only
+    TAKE_PROFIT_PCT = float(env("TAKE_PROFIT_PCT", 0))      # 0 = no fixed cap, let the trail run
+    TRAIL_ACTIVATE_PCT = float(env("TRAIL_ACTIVATE_PCT", 3.0))
     TRAILING_STOP_PCT = float(env("TRAILING_STOP_PCT", 1.0))
+    EXIT_ON_TREND_FLIP = env_bool("EXIT_ON_TREND_FLIP", False)  # off = don't sell on dips
+    STALE_HOURS = float(env("STALE_HOURS", 48))             # sell flat positions after this long
+    STALE_BAND_PCT = float(env("STALE_BAND_PCT", 1.0))      # "flat" = within +/- this %
     FEE_RATE_PCT = float(env("FEE_RATE_PCT", 0.6))          # Coinbase taker fee at your tier
-    COOLDOWN_MIN = int(env("COOLDOWN_MIN", 30))             # wait after a stop-loss
+    COOLDOWN_MIN = int(env("COOLDOWN_MIN", 1440))           # wait 24h after a stop-loss
+
+    # Entry filters
+    MARKET_FILTER = env("MARKET_FILTER", "BTC-USD")         # only buy when this is above its trend EMA
+    MAX_SPREAD_PCT = float(env("MAX_SPREAD_PCT", 0.3))      # skip coins with a wide bid/ask gap
     USE_LIMIT_ORDERS = env_bool("USE_LIMIT_ORDERS", True)   # post-only limits = lower maker fees
     LIMIT_WAIT_SEC = int(env("LIMIT_WAIT_SEC", 90))         # how long a limit order waits to fill
 
@@ -360,16 +370,19 @@ class Bot:
             px = self.price(pid)
             pos["peak"] = max(pos.get("peak", pos["entry_price"]), px)
             change = (px / pos["entry_price"] - 1) * 100
+            held_h = (now - pos.get("opened_at", now)) / 3600
             reason = None
             if change <= -self.cfg.STOP_LOSS_PCT:
                 reason = "stop_loss"
-            elif change >= self.cfg.TAKE_PROFIT_PCT:
+            elif self.cfg.TAKE_PROFIT_PCT > 0 and change >= self.cfg.TAKE_PROFIT_PCT:
                 reason = "take_profit"
             elif (pos["peak"] / pos["entry_price"] - 1) * 100 >= self.cfg.TRAIL_ACTIVATE_PCT and \
                     (px / pos["peak"] - 1) * 100 <= -self.cfg.TRAILING_STOP_PCT:
                 reason = "trailing_stop"
-            elif pos.get("exit_signal"):
+            elif self.cfg.EXIT_ON_TREND_FLIP and pos.get("exit_signal"):
                 reason = "trend_reversal"
+            elif held_h >= self.cfg.STALE_HOURS and abs(change) <= self.cfg.STALE_BAND_PCT:
+                reason = "stale_exit"
             if reason:
                 result = self.sell(pid, pos, px, reason)
                 if result:
@@ -379,7 +392,40 @@ class Bot:
                         self.state["cooldown"][pid] = now + self.cfg.COOLDOWN_MIN * 60
         self._save_state()
 
+    def market_ok(self, now):
+        """True when the market-filter coin (BTC) is above its trend EMA."""
+        if not self.cfg.MARKET_FILTER:
+            return True
+        try:
+            closes = self.closed_candles(self.cfg.MARKET_FILTER, now)
+            trend = ema(closes, self.cfg.TREND_EMA)[-1]
+        except Exception as e:
+            log.warning("market filter data error: %s", e)
+            return False
+        if trend is None:
+            return False
+        ok = closes[-1] > trend
+        if not ok:
+            log.info("%s below trend (%.2f < %.2f): no new buys this round",
+                     self.cfg.MARKET_FILTER, closes[-1], trend)
+        return ok
+
+    def spread_ok(self, pid):
+        if self.cfg.PAPER_TRADING or self.cfg.MAX_SPREAD_PCT <= 0:
+            return True
+        try:
+            bid, ask = self.client.best_bid_ask(pid)
+        except Exception as e:
+            log.warning("spread check failed %s: %s", pid, e)
+            return False
+        spread = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread > self.cfg.MAX_SPREAD_PCT:
+            log.info("%s spread %.2f%% too wide, skipped", pid, spread)
+            return False
+        return True
+
     def check_entries(self, now):
+        can_buy = self.market_ok(now)
         for pid in self.cfg.PRODUCTS:
             try:
                 closes = self.closed_candles(pid, now)
@@ -397,7 +443,7 @@ class Bot:
                 if sig["sell"]:
                     self.state["positions"][pid]["exit_signal"] = True
                 continue
-            if not sig["buy"]:
+            if not sig["buy"] or not can_buy:
                 continue
             if self.daily_limit_hit():
                 log.warning("Daily loss limit hit ($%.2f). No new trades until tomorrow.",
@@ -406,6 +452,8 @@ class Bot:
             if len(self.state["positions"]) >= self.cfg.MAX_OPEN_POSITIONS:
                 continue
             if self.state["cooldown"].get(pid, 0) > now:
+                continue
+            if not self.spread_ok(pid):
                 continue
             px = self.price(pid)
             fill = self.buy(pid, px)
@@ -433,9 +481,13 @@ class Bot:
 # --------------------------------------------------------------------------
 def preflight(cfg=Config):
     round_trip_fee = 2 * cfg.FEE_RATE_PCT
-    if cfg.TAKE_PROFIT_PCT <= round_trip_fee + 0.5:
+    min_win = cfg.TRAIL_ACTIVATE_PCT - cfg.TRAILING_STOP_PCT  # worst case once the trail kicks in
+    if cfg.TAKE_PROFIT_PCT > 0 and cfg.TAKE_PROFIT_PCT <= round_trip_fee + 0.5:
         sys.exit(f"TAKE_PROFIT_PCT {cfg.TAKE_PROFIT_PCT}% is too close to round-trip fees "
                  f"({round_trip_fee:.2f}%). Raise it.")
+    if min_win <= round_trip_fee * 0.5:
+        sys.exit(f"Trailing exit locks in only {min_win:.2f}%, too close to fees. "
+                 f"Raise TRAIL_ACTIVATE_PCT or lower TRAILING_STOP_PCT.")
     if cfg.TRADE_SIZE_USD < 5:
         sys.exit("TRADE_SIZE_USD must be at least $5.")
     if not cfg.PAPER_TRADING:
@@ -456,9 +508,11 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     preflight()
     mode = "PAPER (fake money)" if Config.PAPER_TRADING else "LIVE (REAL MONEY)"
-    log.info("Starting bot in %s mode | products=%s | $%.0f/trade | SL %.1f%% TP %.1f%% | daily max loss $%.0f",
-             mode, Config.PRODUCTS, Config.TRADE_SIZE_USD, Config.STOP_LOSS_PCT,
-             Config.TAKE_PROFIT_PCT, Config.MAX_DAILY_LOSS_USD)
+    log.info("Starting bot in %s mode | products=%s | $%.0f/trade | max %d open | SL %.1f%% | "
+             "trail %.1f%% after +%.1f%% | stale %.0fh | daily max loss $%.0f",
+             mode, Config.PRODUCTS, Config.TRADE_SIZE_USD, Config.MAX_OPEN_POSITIONS,
+             Config.STOP_LOSS_PCT, Config.TRAILING_STOP_PCT, Config.TRAIL_ACTIVATE_PCT,
+             Config.STALE_HOURS, Config.MAX_DAILY_LOSS_USD)
     bot = Bot(make_client())
     while True:
         try:
